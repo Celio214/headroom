@@ -1,0 +1,10 @@
+{
+  "manifestVersion": 1,
+  "id": "headroom-fork",
+  "name": "Headroom (Mon Fork)",
+  "version": "1.0.0",
+  "description": "Compression de tokens synchronisée depuis mon fork.",
+  "icon": "📉",
+  "entrypoint": "main.py",
+  "capabilities": ["mcp-proxy"]
+}
