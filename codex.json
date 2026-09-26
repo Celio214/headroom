@@ -3,8 +3,8 @@
   "id": "headroom-fork",
   "name": "Headroom (Mon Fork)",
   "version": "1.0.0",
-  "description": "Compression de tokens synchronisée depuis mon fork.",
+  "description": "Optimisation et compression de contexte.",
   "icon": "📉",
-  "entrypoint": "main.py",
-  "capabilities": ["mcp-proxy"]
+  "entrypoint": "index.js",
+  "capabilities": ["prompt-injection"]
 }
