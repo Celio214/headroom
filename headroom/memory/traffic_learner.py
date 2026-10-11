@@ -33,6 +33,8 @@ from enum import Enum
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, ClassVar
 
+from headroom.learn._shared import classify_error
+
 if TYPE_CHECKING:
     from headroom.learn.models import ProjectInfo
     from headroom.memory.backends.local import LocalBackend
@@ -125,17 +127,6 @@ class PatternCategory(str, Enum):
     ARCHITECTURE = "architecture"  # File structure, dependencies, conventions
 
 
-class AgentType(str, Enum):
-    """Supported coding agent types."""
-
-    CLAUDE = "claude"
-    CURSOR = "cursor"
-    CODEX = "codex"
-    AIDER = "aider"
-    GEMINI = "gemini"
-    UNKNOWN = "unknown"
-
-
 # =============================================================================
 # Extracted Pattern Model
 # =============================================================================
@@ -218,51 +209,70 @@ def _strip_leading_cd(cmd: str) -> str:
 
 
 # =============================================================================
-# Error Classification (reused from learn/scanner.py patterns)
+# Error Detection
 # =============================================================================
 
-_ERROR_PATTERNS: list[tuple[re.Pattern[str], str]] = [
-    (
-        re.compile(r"No such file or directory|ENOENT|FileNotFoundError|does not exist", re.I),
-        "file_not_found",
-    ),
-    (re.compile(r"ModuleNotFoundError|ImportError|No module named", re.I), "module_not_found"),
-    (re.compile(r"command not found", re.I), "command_not_found"),
-    (re.compile(r"Permission denied|EACCES|EPERM|auto-denied", re.I), "permission_denied"),
-    (re.compile(r"file is too large|too many lines|exceeds.*limit", re.I), "file_too_large"),
-    (re.compile(r"SyntaxError|IndentationError", re.I), "syntax_error"),
-    (re.compile(r"Traceback \(most recent|Exception:|Error:", re.I), "runtime_error"),
-    (re.compile(r"timed? ?out|TimeoutError|deadline exceeded", re.I), "timeout"),
-    (re.compile(r"exit code|non-zero|exited with", re.I), "exit_code"),
-    (re.compile(r"BUILD FAILED|compilation error|compile error", re.I), "build_failure"),
-]
+# OpenAI-format tool results carry no is_error flag, so failures are sniffed
+# from the output. Categories come from headroom.learn._shared.classify_error;
+# these patterns only decide *whether* the output is an error.
+_ERROR_SIGNALS: tuple[re.Pattern[str], ...] = (
+    re.compile(r"No such file or directory|ENOENT|FileNotFoundError|does not exist", re.I),
+    re.compile(r"ModuleNotFoundError|ImportError|No module named", re.I),
+    re.compile(r"command not found", re.I),
+    re.compile(r"Permission denied|EACCES|EPERM|auto-denied", re.I),
+    re.compile(r"file is too large|too many lines|exceeds.*limit", re.I),
+    re.compile(r"SyntaxError|IndentationError", re.I),
+    re.compile(r"Traceback \(most recent|Exception:|Error:", re.I),
+    re.compile(r"timed? ?out|TimeoutError|deadline exceeded", re.I),
+    re.compile(r"BUILD FAILED|compilation error|compile error", re.I),
+)
+
+# Agent harnesses (Codex, Grok, opencode, ...) append "exit code 0" to every
+# SUCCESSFUL shell command, so an exit code only signals an error when it is
+# nonzero (signed codes such as -9 included). Status evidence belongs to its own
+# line: a zero code never hides a separate explicit failure elsewhere in the
+# output (a nonzero code, "non-zero", a signal kill, or an "exited with ..." line
+# that carries no code of its own). A line that ends at "exited with" continues
+# on the next line ("Process exited with\nexit code 0"), so it is not a failure.
+# A standalone "Killed" line is the shell's SIGKILL message, but a successful
+# command can also print that word, so it counts only when no exit status is
+# reported at all. It is recognized even below the short-content cut-off.
+_EXIT_STATUS_RE = re.compile(
+    r"\bexit(?:ed)?(?:\s+with)?(?:\s+exit)?\s+(?:code|status)\s*:?\s*([+-]?\d+)", re.I
+)
+_EXIT_FAILURE_RE = re.compile(r"non-zero|nonzero|exited with signal|killed by signal", re.I)
+_KILLED_LINE_RE = re.compile(r"^\s*Killed(?::\s*\d+)?\s*$", re.M)
+_EXITED_WITH_RE = re.compile(r"exited with(?=\s*\S)", re.I)
 
 
-def _classify_error(content: str) -> str | None:
-    """Classify error content. Returns category or None if not an error."""
-    snippet = content[:2000]
-    for pattern, category in _ERROR_PATTERNS:
-        if pattern.search(snippet):
-            return category
-    return None
+def _exit_status_is_error(snippet: str) -> bool:
+    codes = _EXIT_STATUS_RE.findall(snippet)
+    if any(int(code) != 0 for code in codes) or _EXIT_FAILURE_RE.search(snippet):
+        return True
+    if any(
+        _EXITED_WITH_RE.search(line) and not _EXIT_STATUS_RE.search(line)
+        for line in snippet.splitlines()
+    ):
+        return True
+    return not codes and bool(_KILLED_LINE_RE.search(snippet))
 
 
 def _is_error(content: str) -> bool:
     """Quick check if tool output looks like an error."""
-    if not content or len(content) < 10:
+    if not content:
         return False
-    return _classify_error(content) is not None
+    if len(content) < 10:
+        return bool(_KILLED_LINE_RE.fullmatch(content))
+    snippet = content[:2000]
+    if any(pattern.search(snippet) for pattern in _ERROR_SIGNALS):
+        return True
+    return _exit_status_is_error(snippet)
 
 
 # =============================================================================
 # Tool Call Extractors
 # =============================================================================
 
-# Extract command from Bash tool calls
-_COMMAND_RE = re.compile(r"^(?:source\s+\S+\s*&&\s*)?(.+)", re.I)
-
-# Extract file paths
-_FILE_PATH_RE = re.compile(r"(?:/[\w./-]+(?:\.\w+)?)")
 
 # Extract package/module names from errors
 _MODULE_RE = re.compile(r"No module named ['\"]?(\w[\w.]*)['\"]?")
@@ -758,14 +768,6 @@ class TrafficLearner:
 
         return list(by_hash.values())
 
-    def get_learned_patterns(self) -> list[ExtractedPattern]:
-        """Return patterns from the in-memory accumulator.
-
-        Retained for backwards compatibility. Reads only the accumulator;
-        does not consult persisted rows. Use flush_to_file() for full data.
-        """
-        return [pattern for pattern, count in self._pattern_counts.values() if count >= 1]
-
     async def on_tool_result(
         self,
         tool_name: str,
@@ -793,7 +795,7 @@ class TrafficLearner:
             "input": tool_input,
             "output": tool_output[:2000],  # Cap for memory
             "is_error": is_error,
-            "error_category": _classify_error(tool_output) if is_error else None,
+            "error_category": classify_error(tool_output).value if is_error else None,
             "timestamp": time.time(),
             "agent_type": agent_type,
         }
@@ -1511,7 +1513,9 @@ class TrafficLearner:
         now_iso = datetime.now(timezone.utc).isoformat()
 
         def _bump() -> bool:
-            conn = sqlite3.connect(str(db_path))
+            from ..fileperms import connect_private_sqlite
+
+            conn = connect_private_sqlite(db_path, what="memory store")
             try:
                 cursor = conn.execute(
                     "UPDATE memories SET metadata = json_set("
@@ -1729,12 +1733,17 @@ def _project_for_pattern(pattern: ExtractedPattern, roots: list[ProjectInfo]) ->
     if not candidates:
         return None
 
+    # A path inside a worktree folded into a project belongs to that project.
     # Longest root first — most specific wins
-    roots_sorted = sorted(roots, key=lambda p: len(str(p.project_path)), reverse=True)
+    roots_sorted = sorted(
+        ((path, root) for root in roots for path in (root.project_path, *root.worktree_paths)),
+        key=lambda item: len(str(item[0])),
+        reverse=True,
+    )
 
     for cand in candidates:
-        for root in roots_sorted:
-            root_str = str(root.project_path).rstrip("/\\")
+        for path, root in roots_sorted:
+            root_str = str(path).rstrip("/\\")
             if not root_str:
                 continue
             if (
@@ -1869,6 +1878,14 @@ def _patterns_to_recommendations(patterns: list[ExtractedPattern]) -> list:
     """
     from headroom.learn.models import Recommendation, RecommendationTarget
 
+    # Authoritative lifecycle signal for the item-level merge in the writer:
+    # every pattern the learner still holds for this project, captured before
+    # any per-category ranking or capping so that an item omitted from a
+    # rendered section is not mistaken for an expired one. `_collect_all_patterns`
+    # already dropped rows that no longer exist in memory.db, so an id missing
+    # here means the pattern is gone, not merely unrendered.
+    active_item_ids = frozenset(p.content_hash for p in patterns if p.content_hash)
+
     by_category: dict[PatternCategory, list[ExtractedPattern]] = {}
     for p in patterns:
         by_category.setdefault(p.category, []).append(p)
@@ -1890,7 +1907,15 @@ def _patterns_to_recommendations(patterns: list[ExtractedPattern]) -> list:
             items.sort(key=lambda p: p.evidence_count, reverse=True)
         if not items:
             continue
-        bullets = "\n".join(f"- {p.content}" for p in items)
+        preserve_prior_items = category is not PatternCategory.ERROR_RECOVERY
+        bullets = "\n".join(
+            (
+                f"- {p.content} <!-- headroom:pattern-id:{p.content_hash} -->"
+                if preserve_prior_items
+                else f"- {p.content}"
+            )
+            for p in items
+        )
         recs.append(
             Recommendation(
                 target=target,
@@ -1898,6 +1923,12 @@ def _patterns_to_recommendations(patterns: list[ExtractedPattern]) -> list:
                 content=bullets,
                 confidence=max((p.importance for p in items), default=0.5),
                 evidence_count=sum(p.evidence_count for p in items),
+                preserve_prior_items=preserve_prior_items,
+                # error_recovery is rebuilt from scratch on every render and
+                # `_refine_error_recovery` deliberately drops rows, so the
+                # pre-refine set above is not its lifecycle signal; it must
+                # stay unset while that section replaces rather than merges.
+                active_item_ids=active_item_ids if preserve_prior_items else None,
             )
         )
     return recs
